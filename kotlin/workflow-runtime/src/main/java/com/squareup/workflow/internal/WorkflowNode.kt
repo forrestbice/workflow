@@ -17,18 +17,20 @@ package com.squareup.workflow.internal
 
 import com.squareup.workflow.Snapshot
 import com.squareup.workflow.StatefulWorkflow
+import com.squareup.workflow.Worker.Emitter
+import com.squareup.workflow.Worker.OutputOrFinished
 import com.squareup.workflow.Workflow
 import com.squareup.workflow.WorkflowAction
-import com.squareup.workflow.internal.Behavior.SubscriptionCase
+import com.squareup.workflow.internal.Behavior.WorkerCase
 import com.squareup.workflow.parse
 import com.squareup.workflow.readByteStringWithLength
-import com.squareup.workflow.util.ChannelUpdate.Closed
 import com.squareup.workflow.writeByteStringWithLength
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.ReceiveChannel
+import kotlinx.coroutines.channels.produce
 import kotlinx.coroutines.selects.SelectBuilder
 import kotlin.coroutines.CoroutineContext
 
@@ -48,24 +50,6 @@ internal class WorkflowNode<InputT : Any, StateT : Any, OutputT : Any, Rendering
 ) : CoroutineScope {
 
   /**
-   * Tracks a [ReceiveChannel] that represents a "subscription" to an observable data source, and
-   * a [flag][tombstone] that indicates whether the data source has reported that it's been closed
-   * to the workflow.
-   *
-   * The tombstone flag is `false` when the source is "closed" (channel closed, observable complete,
-   * etc.) and then it is set to `true` so that the close will not be delivered again.
-   *
-   * When [tombstone] is `true`, the subscription will never deliver any more updates to the workflow.
-   *
-   * Terminal subscriptions are kept around so that they won't be unsubscribed and resubscribed to
-   * on the next render pass.
-   */
-  private class Subscription(
-    val channel: ReceiveChannel<*>,
-    var tombstone: Boolean = false
-  )
-
-  /**
    * Context that has a job that will live as long as this node.
    * Also adds a debug name to this coroutine based on its ID.
    */
@@ -81,11 +65,11 @@ internal class WorkflowNode<InputT : Any, StateT : Any, OutputT : Any, Rendering
   }
 
   private val subtreeManager = SubtreeManager<StateT, OutputT>(coroutineContext)
-  private val subscriptionTracker =
-    LifetimeTracker<SubscriptionCase<*, StateT, OutputT>, Any, Subscription>(
-        getKey = { case -> case.idempotenceKey },
-        start = { case -> Subscription(case.channelProvider.invoke(this)) },
-        dispose = { _, subscription -> subscription.channel.cancel() }
+  private val workerTracker =
+    LifetimeTracker<WorkerCase<*, StateT, OutputT>, Any, ReceiveChannel<*>>(
+        getKey = { case -> case },
+        start = { case -> case.launchWorker() },
+        dispose = { _, channel -> channel.cancel() }
     )
 
   private var state: StateT = initialState
@@ -143,15 +127,10 @@ internal class WorkflowNode<InputT : Any, StateT : Any, OutputT : Any, Rendering
     subtreeManager.tickChildren(selector, ::acceptUpdate)
 
     // Listen for any subscription updates.
-    subscriptionTracker.lifetimes
-        .filter { (_, sub) -> !sub.tombstone }
-        .forEach { (case, subscription) ->
-          selector.onChannelUpdate(subscription.channel) { channelUpdate ->
-            if (channelUpdate === Closed) {
-              // Set the tombstone flag so we don't continue to listen to the subscription.
-              subscription.tombstone = true
-            }
-            val update = case.acceptUpdate(channelUpdate)
+    workerTracker.lifetimes
+        .forEach { (case, channel) ->
+          selector.receiveOutputOrFinished(channel) { outputOrFinished ->
+            val update = case.acceptUpdate(outputOrFinished)
             acceptUpdate(update)
           }
         }
@@ -193,9 +172,9 @@ internal class WorkflowNode<InputT : Any, StateT : Any, OutputT : Any, Rendering
 
     behavior = context.buildBehavior()
         .apply {
-          // Start new children/subscriptions, and drop old ones.
+          // Start new children/workers, and drop old ones.
           subtreeManager.track(childCases)
-          subscriptionTracker.track(subscriptionCases)
+          workerTracker.track(workerCases)
         }
 
     return rendering
@@ -240,4 +219,39 @@ internal class WorkflowNode<InputT : Any, StateT : Any, OutputT : Any, Rendering
       val state = workflow.initialState(input, Snapshot.of(stateSnapshot), this@WorkflowNode)
       return Pair(state, Snapshot.of(childrenSnapshot))
     }
+
+  /**
+   * Launches a new coroutine that is a child of this node's scope, and calls
+   * [com.squareup.workflow.Worker.performWork] from that coroutine. Returns a [ReceiveChannel] that
+   * will be used to send anything emitted by [com.squareup.workflow.Worker.Emitter]. The channel
+   * will be closed when `performWork` returns.
+   */
+  @Suppress("EXPERIMENTAL_API_USAGE")
+  private fun <T> WorkerCase<T, StateT, OutputT>.launchWorker(): ReceiveChannel<T> =
+    produce {
+      val emitter = object : Emitter<T> {
+        override suspend fun emitOutput(output: T) = send(output)
+      }
+      worker.performWork(emitter)
+    }
+}
+
+/**
+ * Wraps [ReceiveChannel.onReceiveOrNull] to detect if the channel is actually closed vs just
+ * emitting a null value. Once `receiveOrClosed` support lands in the coroutines library, we should
+ * use that instead.
+ */
+@Suppress("EXPERIMENTAL_API_USAGE")
+private inline fun <R> SelectBuilder<R>.receiveOutputOrFinished(
+  channel: ReceiveChannel<*>,
+  crossinline handler: (OutputOrFinished<*>) -> R
+) {
+  channel.onReceiveOrNull { maybeOutput ->
+    val outputOrFinished = if (maybeOutput == null && channel.isClosedForReceive) {
+      OutputOrFinished.Finished
+    } else {
+      OutputOrFinished.Output(maybeOutput)
+    }
+    return@onReceiveOrNull handler(outputOrFinished)
+  }
 }
